@@ -24,11 +24,15 @@ class BLEManager:
     def __init__(self) -> None:
         self._client: BleakClient | None = None
 
+    RING_NAME_PREFIX = "WIZPR RING"
+
     async def scan(self, seconds: float = 5.0) -> list[DiscoveredDevice]:
         found: Dict[str, Tuple[BLEDevice, AdvertisementData]] = {}
 
         def _cb(device: BLEDevice, adv: AdvertisementData) -> None:
-            found[device.address] = (device, adv)
+            name = (adv.local_name or device.name or "").strip()
+            if name.startswith(self.RING_NAME_PREFIX):
+                found[device.address] = (device, adv)
 
         scanner = BleakScanner(detection_callback=_cb)
         await scanner.start()
@@ -43,15 +47,9 @@ class BLEManager:
             rssi = int(getattr(adv, "rssi", 0) or 0)
             out.append(DiscoveredDevice(address=addr, name=name, rssi=rssi))
         out.sort(key=lambda d: d.rssi, reverse=True)
-        logger.info("BLE scan complete: %d devices found", len(out))
-        for addr, (dev, adv) in sorted(found.items(), key=lambda x: int(getattr(x[1][1], "rssi", 0) or 0), reverse=True):
-            name = (adv.local_name or dev.name or "").strip() or "(no name)"
-            rssi = int(getattr(adv, "rssi", 0) or 0)
-            svc_uuids = [str(u) for u in (getattr(adv, "service_uuids", None) or [])]
-            mfr_data = getattr(adv, "manufacturer_data", None) or {}
-            mfr_str = ", ".join(f"0x{k:04X}:{v.hex()}" for k, v in mfr_data.items()) if mfr_data else ""
-            logger.info("  [%4d dBm] %-36s  %-30s  svc=%s  mfr=%s",
-                        rssi, addr, name, svc_uuids or "[]", mfr_str or "")
+        logger.info("BLE scan complete: %d WIZPR RING devices found", len(out))
+        for d in out:
+            logger.info("  [%4d dBm] %s  %s", d.rssi, d.address, d.name)
         return out
 
     async def connect(self, address: str, timeout: float = 12.0) -> BleakClient:
