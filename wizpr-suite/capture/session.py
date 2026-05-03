@@ -11,17 +11,12 @@ ACTIONS: list[dict[str, str]] = [
     {"id": "button_single", "label": "Single Button Press",       "prompt": "Press the ring button once"},
     {"id": "button_double", "label": "Double Button Press",       "prompt": "Press the ring button twice quickly"},
     {"id": "button_triple", "label": "Triple Button Press",       "prompt": "Press the ring button three times quickly"},
-    {"id": "button_long",   "label": "Long Press",                "prompt": "Press and hold the ring button for 2 seconds"},
     {"id": "voice_short",   "label": "Short Voice Input",         "prompt": 'Speak a short word into the ring (say "Hello")'},
     {"id": "voice_long",    "label": "Long Voice Input",          "prompt": "Speak a full sentence into the ring"},
-    {"id": "tilt_up",       "label": "Tilt Up",                   "prompt": "Tilt the ring upward (raise your hand)"},
-    {"id": "tilt_down",     "label": "Tilt Down",                 "prompt": "Tilt the ring downward (lower your hand)"},
+    {"id": "tilt_up",       "label": "Tilt Up (raise to speak)",  "prompt": "Raise your hand/ring up as if lifting to speak"},
     {"id": "rotate_cw",     "label": "Rotate Clockwise",          "prompt": "Rotate the ring clockwise on your finger"},
     {"id": "rotate_ccw",    "label": "Rotate Counter-Clockwise",  "prompt": "Rotate the ring counter-clockwise on your finger"},
-    {"id": "shake",         "label": "Shake",                     "prompt": "Shake the ring / your hand"},
     {"id": "tap_body",      "label": "Tap Ring Body",             "prompt": "Tap the ring body with your other finger"},
-    {"id": "wear",          "label": "Wear Ring",                 "prompt": "Put the ring on your finger"},
-    {"id": "remove",        "label": "Remove Ring",               "prompt": "Take the ring off your finger"},
     {"id": "idle",          "label": "Idle Baseline",             "prompt": "Hold still — do nothing for 5 seconds"},
 ]
 
