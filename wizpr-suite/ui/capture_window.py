@@ -61,6 +61,10 @@ class CaptureWindow(QtWidgets.QMainWindow):
         self._connect_status.setStyleSheet("font-size: 18px;")
         self._connect_status.setWordWrap(True)
         layout.addWidget(self._connect_status)
+        self._btn_rescan = QtWidgets.QPushButton("Scan Again")
+        self._btn_rescan.setVisible(False)
+        self._btn_rescan.clicked.connect(self._rescan)
+        layout.addWidget(self._btn_rescan, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
         return page
 
     def _make_discovering_page(self) -> QtWidgets.QWidget:
@@ -170,14 +174,19 @@ class CaptureWindow(QtWidgets.QMainWindow):
         super().showEvent(event)
         asyncio.ensure_future(self._run_connect())
 
+    def _rescan(self) -> None:
+        self._btn_rescan.setVisible(False)
+        asyncio.ensure_future(self._run_connect())
+
     async def _run_connect(self) -> None:
         try:
             self._status_signal.emit("Scanning for WIZPR RING...")
             devs = await self._ble.scan(seconds=8.0)
             if not devs:
                 self._status_signal.emit(
-                    "No WIZPR RING found.\n\nMake sure it's disconnected from your iPhone,\nthen restart the app."
+                    "No WIZPR RING found.\n\nDisconnect it from your iPhone first,\nthen tap Scan Again."
                 )
+                self._btn_rescan.setVisible(True)
                 return
             dev = devs[0]
             self._status_signal.emit(f"Found {dev.name}\nConnecting...")
