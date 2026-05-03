@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 
 from ..ble.ble_manager import BLEManager
 from ..ble.ring_controller import RingController, RingProfile
@@ -50,6 +50,7 @@ class CaptureWindow(QtWidgets.QMainWindow):
         self._stack.addWidget(self._make_discovering_page())  # 1
         self._stack.addWidget(self._make_capture_page())      # 2
         self._stack.addWidget(self._make_done_page())         # 3
+        self._stack.addWidget(self._make_explorer_page())     # 4
         self._apply_style()
 
     def _make_connecting_page(self) -> QtWidgets.QWidget:
@@ -136,8 +137,61 @@ class CaptureWindow(QtWidgets.QMainWindow):
         self._done_path.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self._done_path.setStyleSheet("font-size: 12px; color: #aaa;")
         self._done_path.setWordWrap(True)
+        btn_explore = QtWidgets.QPushButton("Explore Commands →")
+        btn_explore.clicked.connect(lambda: self._stack.setCurrentIndex(4))
         layout.addWidget(self._done_label)
         layout.addWidget(self._done_path)
+        layout.addSpacing(20)
+        layout.addWidget(btn_explore)
+        return page
+
+    def _make_explorer_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        lbl = QtWidgets.QLabel("Command Explorer")
+        lbl.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(lbl)
+
+        sub = QtWidgets.QLabel("Send ASCII commands to the ring and watch responses.\nChar 00000007 is the main command channel.")
+        sub.setStyleSheet("font-size: 12px; color: #888;")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        # Quick command buttons
+        quick_label = QtWidgets.QLabel("Quick commands:")
+        quick_label.setStyleSheet("font-size: 12px; color: #aaa;")
+        layout.addWidget(quick_label)
+        quick_row = QtWidgets.QHBoxLayout()
+        for cmd in ["MIC_OFF", "MIC_ON", "STATUS", "PING", "RESET"]:
+            btn = QtWidgets.QPushButton(cmd)
+            btn.clicked.connect(lambda checked, c=cmd: self._send_command(c))
+            quick_row.addWidget(btn)
+        layout.addLayout(quick_row)
+
+        # Custom command input
+        input_row = QtWidgets.QHBoxLayout()
+        self._cmd_input = QtWidgets.QLineEdit()
+        self._cmd_input.setPlaceholderText("Type a command and press Send...")
+        self._cmd_input.returnPressed.connect(self._send_custom_command)
+        self._cmd_input.setStyleSheet("background: #181825; border: 1px solid #45475a; border-radius: 4px; padding: 6px; font-family: monospace;")
+        self._btn_send = QtWidgets.QPushButton("Send")
+        self._btn_send.clicked.connect(self._send_custom_command)
+        input_row.addWidget(self._cmd_input)
+        input_row.addWidget(self._btn_send)
+        layout.addLayout(input_row)
+
+        # Response log
+        self._explorer_log = QtWidgets.QListWidget()
+        self._explorer_log.setStyleSheet("font-family: monospace; font-size: 11px; background: #181825; border: 1px solid #313244;")
+        layout.addWidget(self._explorer_log)
+
+        btn_back = QtWidgets.QPushButton("← Back")
+        btn_back.clicked.connect(lambda: self._stack.setCurrentIndex(3))
+        layout.addWidget(btn_back)
+
         return page
 
     def _apply_style(self) -> None:
@@ -156,11 +210,14 @@ class CaptureWindow(QtWidgets.QMainWindow):
 
     # ── Signal wiring ──────────────────────────────────────────────────
 
+    _explorer_signal = QtCore.Signal(str, str)  # direction (→/←), text
+
     def _connect_signals(self) -> None:
         self._status_signal.connect(self._connect_status.setText)
         self._page_signal.connect(self._stack.setCurrentIndex)
         self._payload_signal.connect(self._on_payload_received)
         self._done_signal.connect(self._on_session_done)
+        self._explorer_signal.connect(self._on_explorer_event)
 
         self._btn_capture.clicked.connect(self._start_capture)
         self._btn_skip.clicked.connect(self._skip_action)
@@ -202,12 +259,20 @@ class CaptureWindow(QtWidgets.QMainWindow):
     async def _run_discover(self) -> None:
         try:
             gatt = await self._ring.gatt_summary()
+            device_info = await self._ring.read_device_info()
             if self._session:
                 self._session.gatt_map = gatt
+                self._session.device_info = device_info
 
             def _on_notify(char_uuid: str, data: bytearray) -> None:
                 if self._capturing:
                     self._payload_signal.emit(char_uuid, data.hex())
+                # always feed explorer
+                try:
+                    txt = data.decode("utf-8").strip()
+                except Exception:
+                    txt = data.hex()
+                self._explorer_signal.emit("←", f"{char_uuid[-8:]}  {txt}")
 
             await self._ring.subscribe_all(_on_notify)
             self._page_signal.emit(2)
@@ -300,3 +365,32 @@ class CaptureWindow(QtWidgets.QMainWindow):
 
     def _on_session_done(self, path: str) -> None:
         self._done_path.setText(f"Saved to:\n{path}")
+
+    # ── Command explorer ───────────────────────────────────────────────
+
+    COMMAND_CHAR = "00000007-dc2e-4362-93d3-df429eb3ad10"
+
+    def _send_command(self, cmd: str) -> None:
+        asyncio.ensure_future(self._do_send_command(cmd))
+
+    def _send_custom_command(self) -> None:
+        cmd = self._cmd_input.text().strip()
+        if cmd:
+            self._cmd_input.clear()
+            self._send_command(cmd)
+
+    async def _do_send_command(self, cmd: str) -> None:
+        try:
+            await self._ring.write_command(self.COMMAND_CHAR, cmd)
+            self._explorer_signal.emit("→", f"SENT: {cmd}")
+        except Exception as e:
+            self._explorer_signal.emit("!", f"ERROR: {e}")
+
+    def _on_explorer_event(self, direction: str, text: str) -> None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        color = "#89b4fa" if direction == "→" else "#a6e3a1" if direction == "←" else "#f38ba8"
+        item = QtWidgets.QListWidgetItem(f"{ts}  {direction}  {text}")
+        item.setForeground(QtGui.QColor(color))
+        self._explorer_log.addItem(item)
+        self._explorer_log.scrollToBottom()

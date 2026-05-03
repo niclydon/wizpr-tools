@@ -49,6 +49,7 @@ class CaptureSession:
     device_name: str
     device_address: str
     gatt_map: list[dict[str, Any]] = field(default_factory=list)
+    device_info: dict[str, str] = field(default_factory=dict)
     captures: list[ActionCapture] = field(default_factory=list)
 
     @staticmethod

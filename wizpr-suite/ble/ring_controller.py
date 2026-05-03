@@ -106,6 +106,36 @@ class RingController:
         self._notify_handlers.pop(char_uuid, None)
         logger.info("Unsubscribed notify: %s", char_uuid)
 
+    async def read_device_info(self) -> dict[str, str]:
+        """Read all readable characteristics and return {uuid: value}."""
+        client = self.ble.client()
+        if client is None:
+            return {}
+        info: dict[str, str] = {}
+        for service in client.services:
+            for char in service.characteristics:
+                if "read" in (getattr(char, "properties", []) or []):
+                    try:
+                        raw = await client.read_gatt_char(char.uuid)
+                        try:
+                            value = raw.decode("utf-8").strip()
+                        except Exception:
+                            value = raw.hex()
+                        info[str(char.uuid)] = value
+                        logger.info("READ %s (%s) = %r", char.uuid, getattr(char, "description", ""), value)
+                    except Exception as e:
+                        logger.warning("Could not read %s: %s", char.uuid, e)
+        return info
+
+    async def write_command(self, char_uuid: str, command: str) -> None:
+        """Write an ASCII command string to a characteristic."""
+        client = self.ble.client()
+        if client is None:
+            raise RuntimeError("Not connected")
+        data = (command + "\r\n").encode("utf-8")
+        await client.write_gatt_char(char_uuid, data)
+        logger.info("WRITE %s  cmd=%r", char_uuid, command)
+
     async def subscribe_all(self, callback: Callable[[str, bytearray], None]) -> List[str]:
         """Subscribe to every notify characteristic and return their UUIDs."""
         client = self.ble.client()
