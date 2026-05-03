@@ -69,19 +69,28 @@ This is the primary bidirectional channel. The ring sends ASCII events as notifi
 
 ---
 
-#### Characteristic `00000001` — Audio Stream
+#### Characteristic `00000001` - Audio Stream
 
 **Properties:** indicate, notify
 
-Streams raw binary audio packets while the microphone is active (between `MIC_ON` and `MIC_OFF` events).
+Streams encoded audio packets while the microphone is active (between `MIC_ON` and `MIC_OFF` events).
 
 **Observed behavior:**
-- ~24 packets per second at maximum mic activity
-- Each packet: ~200 bytes of binary data
+- ~35.4 packets per second while mic is on
+- Each packet: 224 bytes (fixed - this was the diagnostic that ruled out variable-bitrate codecs)
 - Stream starts within ~50ms of `MIC_ON`
 - Stream stops immediately on `MIC_OFF`
 
-**Codec:** Unknown. The data is binary (not PCM 16-bit LE — values don't follow a clean waveform distribution). Likely ADPCM, Opus, or a proprietary compressed codec. Decoding requires further analysis.
+**Codec:** IMA ADPCM (Intel/DVI ADPCM), 4-bit, 16 kHz mono.
+
+- 224 bytes per packet x 2 nibbles/byte = 448 samples
+- 448 samples / 16 kHz = 28 ms of audio per packet
+- 35.4 packets/second x 28 ms/packet = 0.99 seconds of audio per real second (1% packet-boundary loss)
+- Encoded bitrate: ~64 kbps; decoded PCM bitrate: 256 kbps (16-bit, 16 kHz, mono)
+
+**Critical:** ADPCM predictor state and step index are continuous across BLE packets. Do NOT reset state between notifications. Each packet continues the running predictor from the previous one. Resetting state per packet produces noise.
+
+Full decoder snippet, real-time decoder class, and integration sequence: see [`audio_protocol.md`](audio_protocol.md).
 
 ---
 
@@ -206,10 +215,22 @@ The iOS app sends this once when the user closes the app or the session ends. Pr
 
 ## Audio Format
 
-The raw audio bytes on char1 are not standard PCM. First-byte analysis across multiple packets shows non-uniform distribution inconsistent with raw linear PCM. Candidates: ADPCM (IMA/DVI), mSBC (used in BT HFP), Opus, or a Silicon Labs proprietary codec.
+Identified 2026-05-03. See [`audio_protocol.md`](audio_protocol.md) for full decoder details.
 
-Decoding is the remaining open problem before the audio stream can be played back or transcribed directly without going through a cloud STT API.
+| Property | Value |
+|---|---|
+| Codec | IMA ADPCM (Intel/DVI ADPCM), 4-bit |
+| Sample rate | 16,000 Hz |
+| Channels | mono |
+| Frame size | 224 bytes per BLE packet |
+| Samples per packet | 448 (224 bytes x 2 nibbles) |
+| Frame duration | 28 ms |
+| Packet rate | ~35.4 pkt/s |
+| Encoded bitrate | ~64 kbps |
+| State | continuous across packets |
 
-**Packets per second:** ~24  
-**Bytes per packet:** ~200  
-**Estimated bitrate:** ~38.4 kbps (before compression, if compressed codec the source rate would be higher)
+### Identification method
+
+All 243 audio packets across two voice captures were exactly 224 bytes - fixed size. This single observation ruled out Opus and every other variable-bitrate codec before any decode was attempted, since VBR codecs produce variable-length frames per packet. Two codec hypotheses fit the math (ADPCM at 16 kHz, or mu-law/A-law at 8 kHz - both produce ~28 ms per 224-byte packet at the observed rate). Tested all candidates by decoding 243 packets to WAV with `scripts/analyze_audio.py`. Only `adpcm_cont_16000` produced intelligible audio.
+
+The lesson: when reverse-engineering an unknown audio stream, measure invariants first (packet size constancy, packet rate, payload size distribution) before reaching for a decoder library. The invariants narrow the search space dramatically.
