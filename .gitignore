@@ -1,8 +1,24 @@
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
-.venv/
 *.egg-info/
 dist/
 build/
+
+# Environment
+.venv/
 .python-version
+.env
+*.env
+
+# Claude / agent internals
+.claude/
+.remember/
+docs/superpowers/
+
+# Captured session data (local only, can be large)
+~/.wizprsuite/captures/
+
+# macOS
+.DS_Store
