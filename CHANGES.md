@@ -1,170 +1,109 @@
 # Changes & Decisions
 
-A running log of what changed, why, and what was rejected. Decisions live here so the code stays clean.
+Newest entry on top. One entry per meaningful decision or discovery. Append as you go.
 
 ---
 
-## 2026-05-02 — Initial fork, setup, first protocol captures
+## 2026-05-03 — btsnoop analysis: iOS app sends only one command
 
-### Forked R-D-BioTech-Alaska/Wizpr-Suite
+Captured BLE traffic from the official iOS Wizpr app using Apple PacketLogger with a Bluetooth diagnostic profile on iPhone 16 Pro. 7,113 HCI records. Of 202 ACL TX packets (phone → controller), exactly **2 were addressed to the ring's connection handle (0x403)**: both ATT WRITE_REQ to handle `0x0029` (char7), value `LOCK\r\n`.
 
-**Decision:** Fork rather than build from scratch.
+**The iOS app's complete outbound vocabulary is one command: LOCK.** Sent when the user closes a session.
 
-The upstream project had already solved the hard problem: figuring out how to connect to the ring over BLE at all. It used `bleak` on Windows/macOS, built a GATT inspector that enumerates services and characteristics, and wired up a PySide6 UI. More importantly, the author had already identified that the ring's protocol is completely undocumented and that the path forward is user-controlled reverse engineering. Starting from that scaffolding instead of from scratch saved at least a day.
+**Why this matters:** The ring is almost entirely self-directing. The phone's job is to listen, not to orchestrate. No session handshake on connect, no mic activation command, no audio config writes. This dramatically simplifies the iOS app — connect, subscribe, handle events, write LOCK when done.
 
-The upstream README says: "The ring protocol is not public (and may vary by firmware). This project is built for rapid integration anyway." That framing is exactly right and directly informed the approach taken here.
+**Setup friction:** PacketLogger shows the connected iPhone but captures zero traffic without an Apple Bluetooth diagnostic profile installed from `developer.apple.com/bug-reporting/profiles-and-logs/`. The profile enables kernel-level HCI logging. Without it, the UI is connected but the capture hook is not active.
 
-**What we kept:** BLE layer (`ble_manager.py`, `ring_controller.py`), core event bus and action routing, PySide6 patterns.
-
-**What we replaced:** The entire UI (tabbed LLM control plane → linear guided capture flow), the purpose (general-purpose LLM router → focused protocol discovery tool).
+**File format:** PacketLogger's `.btsnoop` export is Apple's native format, not standard btsnoop. Magic bytes `1c0000002f6ff669` differ from `btsnoop\0`. Custom parser: records are `uint32_le length + uint64_le timestamp + uint8 type + payload`. Types: 0=HCI_CMD, 1=HCI_EVENT, 2=ACL_TX, 3=ACL_RX, 252=text metadata.
 
 ---
 
-### Renamed repo: `Wizpr-Suite` → `wizpr-tools`
+## 2026-05-03 — Live command probing via ring_daemon: BATTERY and GET_VERSION confirmed
 
-**Decision:** Different name to signal different purpose.
+Probed ~40 ASCII commands against char7 via the ring daemon. Results:
 
-The upstream is an app. This is a workshop. `wizpr-tools` makes clear it's a toolbox for exploring and mapping the ring, not a finished product. The iOS app, MCP integrations, and anything else that comes out of this work will be separate repos.
+**Confirmed working (char7 notify response):**
+- `BATTERY` → `BATTERY 87(3.679147)` — percentage and voltage. Consistent across multiple calls, voltage drops slightly between calls as expected.
+- `GET_VERSION` → `VER A005` — application firmware version.
+- `RESET` → ring disconnects immediately — confirmed live reboot command. Caused all subsequent probe attempts in that session to fail with "Service Discovery has not been performed yet".
 
----
+**Silent but accepted (no response, no physical effect):**
+MIC_ON, MIC_OFF, LED_ON, LED_OFF, HAPTIC, VIBRATE, BEEP, STATUS, INFO, WAKE, GYRO, ACC, TEMP, GET_STATE, and ~25 others. The ring processes writes but its vocabulary is small.
 
-### Fixed four missing `@dataclass` decorators
-
-The original code had `class RingProfile`, `class DiscoveredDevice`, `class OpenAIConfig`, `class OllamaConfig`, `class OpenAICompatConfig`, and `class AppConfig` all using dataclass features (`field()`, `asdict()`, etc.) without the `@dataclass` decorator. This caused `TypeError: RingProfile() takes no arguments` on first launch on macOS.
-
-Also fixed: `self.ble.client` was defined as a method but called as a property in `gatt_summary()`, `subscribe()`, and `unsubscribe()`. Changed to `self.ble.client()`.
-
-These were straightforward bugs, not design decisions. Committed as individual fixes so the history is readable.
+**Echo buffer behavior confirmed:** Reading char7 after a write returns the last written value zero-padded to 250 bytes. Not a response register. The contamination artifact (`STATUS\r\nERY` showing up after `STATUS`) is leftover bytes from `BATTERY` in the buffer — the null-padding doesn't fully zero the previous content.
 
 ---
 
-### Built guided capture tool (replaced original UI)
+## 2026-05-02 — ring_daemon: persistent FIFO-based ring shell
 
-**Decision:** Replace the tabbed LLM control plane with a linear capture flow.
+Built `scripts/ring_daemon.py` — a persistent connection daemon that holds the ring's BLE connection and processes commands from a named FIFO at `/tmp/ring.cmd`, logging everything to `/tmp/ring.log`.
 
-The original UI had tabs for Devices, Models, Chat, Commands, Logs — a full LLM assistant UI. For protocol discovery, none of that was useful. What was needed was: connect, subscribe to everything, walk through labeled actions, save structured JSON.
+**Why:** The original probe workflow required write script → push git → pull MacBook → launch via osascript → wait → read log. Each round trip was 2-3 minutes. With the daemon, sending a command and reading the response takes under 2 seconds from any SSH terminal.
 
-**The flow:** auto-scan for WIZPR RING → connect → GATT enumerate → subscribe all notify characteristics → guided action prompts (one at a time, 5-second countdown) → JSON output.
+**Why FIFO not HTTP:** Zero dependencies. No port to manage, no server lifecycle, no framework. `echo "write 7 BATTERY" > /tmp/ring.cmd` is the entire client interface.
 
-**Guided vs. manual labeling:** Chose guided (app tells you what to do) over manual (user types the label). Reason: consistent labeling across sessions, no human error in the label, makes the JSON directly comparable across captures.
-
-**`qasync` for event loop:** PySide6's Qt event loop and Python's asyncio don't share a loop by default. `qasync` bridges them so BLE async callbacks fire correctly while the Qt UI stays responsive. Without it, the BLE scan would block the UI thread.
-
-**Audio freeze bug:** First run of the capture tool froze during voice captures. Root cause: BLE audio stream fires ~24 packets/second, each 200 bytes. The payload list widget was rendering every packet as a 400-character hex string at 24fps — killed the Qt main thread. Fix: audio packets (char `00000001`) are captured silently to JSON, shown only as a single updating counter (`🎙 Audio stream: N packets captured`). ASCII event packets (CLICK, MIC_ON, etc.) still show in the live list.
+**Bluetooth authorization constraint on macOS:** Processes launched via SSH don't have Bluetooth permission — macOS requires the process to run in a user's active GUI session. The daemon is launched via `osascript` (opens a Terminal window) so it runs with full permissions. SSH sessions can then write to the FIFO and read the log without touching Bluetooth directly.
 
 ---
 
-### Action list decisions
+## 2026-05-02 — Capture tool: audio freeze fixed
 
-**Removed from capture suite:**
+First run of the guided capture tool froze during voice captures. Countdown timer queued up, then fired all at once when the thread freed.
 
-- `button_long` (long press) — turns the device off. Found out on first test run. Not a capture-able event.
-- `tilt_down` — no signal. Three sessions confirmed zero payloads.
-- `wear` / `remove` — no signal. Ring doesn't have proximity or capacitance sensor exposed over BLE.
-- `shake` — no signal. The ring's IMU doesn't distinguish shake from other motion at the protocol level.
+**Root cause:** The BLE audio stream fires ~24 notifications per second, each ~200 bytes. The payload list widget was calling `addItem()` with a 400-char hex string at 24fps and `scrollToBottom()` on every packet — killed the Qt main thread.
 
-**Retained:**
+**Fix:** Audio packets (char `00000001`) are captured to the session JSON silently. The live display shows a single updating label (`🎙 Audio stream: N packets captured`) instead of one row per packet. ASCII events (CLICK, MIC_ON, etc.) still render normally — they arrive at most a few times per second.
 
-- `button_single`, `button_double`, `button_triple` — clear CLICK count signal, fully confirmed.
-- `voice_short`, `voice_long` — MIC_ON/MIC_OFF cycle, audio stream on char1.
-- `tilt_up` — generates MIC_PRE_ON → MIC_ON. The ring's raise-to-speak gesture.
-- `rotate_cw`, `rotate_ccw` — generates MIC cycling, same as tilt. Not a distinct gesture at protocol level, but worth capturing.
-- `tap_body` — generates MIC_PRE_ON. Same motion trigger as tilt.
-- `idle` — baseline noise capture. Zero events confirmed.
+**Rejected alternative:** Rate-limiting the display (show every Nth packet). Rejected because the count label is more useful than partial hex dumps anyway.
 
 ---
 
-### BLE scan filter: WIZPR RING prefix only
+## 2026-05-02 — Three capture sessions: protocol initial mapping
 
-**Decision:** Filter scan results to devices whose name starts with `"WIZPR RING"`.
+Three guided capture sessions run (sessions saved to `~/.wizprsuite/captures/` on MacBook). Confirmed across sessions:
 
-The original app showed all 88+ BLE devices in the neighborhood (AirPods, Govee lights, TVs, neighbors' devices). Once the ring's advertised name was confirmed (`WIZPR RING-97:22`), there was no reason to surface any other device. The UI now shows only WIZPR RING devices.
+**Button:** `CLICK\r\n` on char7, one event per press. Count = press type (1/2/3). Zero ambiguity.
 
-**How we found the name:** The first several scans failed to find it because the ring was connected to an iPhone and wasn't advertising. Once disconnected from the iPhone, it appeared immediately as `WIZPR RING-97:22`. The `-97:22` suffix is the last two bytes of the ring's Bluetooth MAC address (`28:76:81:FA:97:22` — the `28:76:81` OUI belongs to Silicon Labs).
+**Mic events:** `MIC_PRE_ON\r\n`, `MIC_ON\r\n`, `MIC_OFF\r\n` on char7. `MIC_PRE_ON` fires ~100ms before `MIC_ON`. The ring's IMU triggers this sequence — any significant motion above threshold activates it, not just deliberate raise-to-speak. Rotate and tap-body both triggered the same MIC sequence.
 
----
+**Audio:** char1 (`00000001`) streams binary at ~24 packets/second while mic is active. Codec unknown.
 
-### `ring_daemon.py` — persistent interactive shell
+**Baseline:** idle action captured zero events across all three sessions. Clean floor.
 
-**Decision:** Build a persistent ring connection daemon instead of one-shot scripts.
+**Actions removed after first session:**
+- `button_long` — turns the device off. Discovered on first test.
+- `tilt_down`, `wear`, `remove`, `shake` — zero payloads across all sessions.
 
-Early probing required: write a script → push to git → pull on MacBook → launch via osascript → wait → read log. Each round trip was 2–3 minutes. The ring daemon (`scripts/ring_daemon.py`) connects once, subscribes to everything, then reads commands from a named FIFO at `/tmp/ring.cmd` and writes all output to `/tmp/ring.log`. Commands can be sent via `echo "write 7 BATTERY" > /tmp/ring.cmd` from any SSH session.
-
-**Why FIFO not HTTP:** Simplest possible IPC. No dependencies, no port management, no server lifecycle. The FIFO approach means any SSH command can interact with the ring in under 100ms.
-
-**Bluetooth authorization:** Bleak on macOS requires the process to run in a GUI session with Bluetooth permission. Direct SSH processes don't have this permission. Solution: write scripts to `/tmp/*.py` and launch via `osascript` Terminal, then SSH to write to the FIFO and read the log file. Two SSH connections, one GUI process — clean separation.
+**Device info read:** Silicon Labs manufacturer, firmware `9.0.0` (BLE stack), system ID `287681fffefa9722`. System ID decodes as MAC `28:76:81:FA:97:22` — OUI `28:76:81` = Silicon Labs, last 2 bytes `97:22` match advertised name suffix.
 
 ---
 
-## 2026-05-03 — Protocol mapping complete, btsnoop analysis
+## 2026-05-02 — Built guided capture tool (replaced original UI)
 
-### Confirmed command vocabulary via live daemon probing
+Replaced the upstream tabbed LLM control plane with a linear guided capture flow. Original UI had Devices, Models, Chat, Commands, and Logs tabs — none relevant for protocol discovery.
 
-Probed ~40 ASCII commands against char7. Results:
+**New flow:** auto-scan for WIZPR RING → connect → enumerate GATT + read device info → subscribe all notify characteristics → guided action prompts one at a time (5-second countdown) → JSON output at `~/.wizprsuite/captures/YYYY-MM-DD-HH-MM-SS.json`.
 
-**Commands with notify responses (confirmed working):**
-- `BATTERY` → `BATTERY 87(3.679147)` — percentage + voltage
-- `GET_VERSION` → `VER A005` — application firmware version
-- `RESET` → ring disconnects — confirmed reboot command
+**`qasync` for event loop:** PySide6 and asyncio don't share a loop by default. `qasync` bridges them so BLE async callbacks fire while Qt stays responsive. Bleak requires asyncio; PySide6 requires Qt. Both are needed concurrently.
 
-**Commands silently accepted, no response:**
-- `MIC_ON`, `MIC_OFF`, `LED_ON`, `LED_OFF`, `HAPTIC`, `VIBRATE`, `BEEP`, `STATUS`, `INFO`, `WAKE`, `GYRO`, `ACC`, `TEMP`, `GET_STATE`, dozens more
+**Guided vs manual labeling:** Chose guided (app instructs the action) over manual (user types a label). Reason: consistent labels across sessions, no transcription error, JSON directly comparable across captures.
 
-**Why RESET is significant:** Every other unknown command was silently absorbed. RESET actually rebooted the ring. This confirms char7 is a live command channel, not just a logging buffer. The ring processes writes — it just has a very small vocabulary.
-
-**The echo buffer:** Char7 is readable. Reading it after a write returns the last written value zero-padded to 250 bytes. This is not a response channel — it's a write buffer. Confirmed by observing contamination: reading after `STATUS` showed `STATUS\r\nERY` because `BATTERY` was in the buffer from a previous write and the null-padding didn't fully clear.
+**Action list rationale:** 15 initial actions reduced to 10 after first session. Removed long press (off switch), tilt down (no signal), wear/remove (no proximity sensor exposed), shake (no distinct IMU event). Kept single/double/triple button, voice short/long, tilt up, rotate cw/ccw, tap body, idle.
 
 ---
 
-### btsnoop analysis — iOS app only sends `LOCK`
+## 2026-05-02 — BLE scan filter: WIZPR RING prefix only
 
-Captured BLE traffic from the official iOS Wizpr app using Apple PacketLogger with a Bluetooth logging profile installed on iPhone 16 Pro.
+Original scan returned 88+ devices. Filtered to name prefix `WIZPR RING` once the advertised name was confirmed.
 
-**Setup friction:** PacketLogger initially showed nothing because it needs an Apple Bluetooth diagnostic profile installed on the iPhone to actually capture traffic. Without the profile, it shows the device name but captures zero packets. Profile installed from `developer.apple.com/bug-reporting/profiles-and-logs/`.
-
-**File format:** PacketLogger exported as `.btsnoop` but the file is actually Apple's native PacketLogger format (magic bytes differ from standard btsnoop). Wrote a custom parser that reads the `length (4 LE) + timestamp (8 LE) + type (1) + payload` record structure.
-
-**Result:** 7,113 records, 202 ACL TX packets, but only **2 TX packets to the ring's connection handle (0x403)**. Both were ATT WRITE_REQ to handle `0x0029` (char7) with value `LOCK\r\n`.
-
-**What LOCK does:** Sent by the iOS app when the session ends (observed twice in a capture session). Presumably disables ring input — mic, motion, button — until the next connection or wake event.
-
-**Implication:** The iOS app is almost entirely a listener. It subscribes to char7 and char1, handles events, streams audio — and only writes back when closing out a session. The ring is self-contained. This is excellent news for building a custom iOS app: there's no complex command handshake, no session initialization sequence, no auth. Connect, subscribe, listen, send LOCK when done.
+**How the name was found:** First several scans returned nothing because the ring was connected to an iPhone and not advertising. Disconnecting it from the iPhone (Settings → Bluetooth → Disconnect) made it appear immediately as `WIZPR RING-97:22`. The `-97:22` suffix is the last two bytes of the MAC address, a common BLE convention.
 
 ---
 
-### Device identity confirmed
+## 2026-05-02 — Initial fork: R-D-BioTech-Alaska/Wizpr-Suite → niclydon/wizpr-tools
 
-From the Device Information service (standard BLE `0x180A`):
+Forked rather than built from scratch. The upstream had solved the hard parts: BLE scan/connect via bleak, GATT inspector, PySide6 patterns, and the framing that the ring's protocol is undocumented and requires user-controlled reverse engineering.
 
-| Characteristic | Value |
-|---|---|
-| Manufacturer Name | Silicon Labs |
-| Firmware Revision | 9.0.0 (BLE stack) |
-| System ID | `287681fffefa9722` |
+Fixed four missing `@dataclass` decorators on `RingProfile`, `DiscoveredDevice`, `OpenAIConfig`, `OllamaConfig`, `OpenAICompatConfig`, `AppConfig` — all used dataclass features without the decorator, causing `TypeError: X() takes no arguments` on first launch. Also fixed `self.ble.client` called as property when defined as method in three places.
 
-System ID is IEEE EUI-64 format. Remove the `fffffe` middle bytes: MAC = `28:76:81:FA:97:22`. OUI `28:76:81` = Silicon Labs. Last two bytes `97:22` match the advertised name suffix `WIZPR RING-97:22`. Confirmed.
-
-Application firmware version (from `GET_VERSION` command): `VER A005`.
-
----
-
-### Chars 2, 3, 4, 6 — write-only, purpose unknown
-
-Five write-only characteristics on the ring's custom service (`00000000-dc2e-4362-93d3-df429eb3ad10`):
-
-- `00000002` — Unknown
-- `00000003` — Description says "RFCOMM" (repurposed UUID, not actual RFCOMM)
-- `00000004` — Unknown
-- `00000006` — Unknown
-
-Probed with: ASCII strings (all known commands), single bytes `0x00`, `0x01`, `0xff`, `0xaa`, `0x55`, two-byte patterns. Zero notify responses to anything. No physical effects observed.
-
-**Current hypothesis:** These may be audio configuration or stream control channels that require a specific binary framing the iOS app uses internally but never exposed in the capture session. Alternatively, they may be unused vestiges in the firmware. Not blocking for iOS app development since the audio stream (char1) works fine without touching them.
-
-**What was not tried:** Binary framing with length prefixes, checksum-protected packets, or multi-packet sequences. If these ever need to be reverse-engineered further, a longer btsnoop capture where the iOS app is exercised more heavily would be the next step.
-
----
-
-### `f7bf3564` (service `1d14d6ee`) — not probed
-
-The third GATT service has one write-only characteristic (`f7bf3564-fb6d-4e53-88a4-5e37e0326063`). All probe attempts after `RESET` failed because the ring had disconnected. In the btsnoop capture, zero writes to this handle were observed from the iOS app. Likely OTA update or factory config channel. Not needed for the iOS app.
+Renamed `Wizpr-Suite` → `wizpr-tools` to signal different purpose: this is a workshop for protocol exploration, not a finished LLM assistant app. Future apps (iOS, MCP tools) are separate repos.
