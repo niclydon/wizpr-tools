@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from bleak import BleakClient  # type: ignore
 
@@ -105,3 +105,30 @@ class RingController:
             pass
         self._notify_handlers.pop(char_uuid, None)
         logger.info("Unsubscribed notify: %s", char_uuid)
+
+    async def subscribe_all(self, callback: Callable[[str, bytearray], None]) -> List[str]:
+        """Subscribe to every notify characteristic and return their UUIDs."""
+        client = self.ble.client()
+        if client is None:
+            raise RuntimeError("Not connected")
+        subscribed: List[str] = []
+        for service in client.services:
+            for char in service.characteristics:
+                if "notify" in (getattr(char, "properties", []) or []):
+                    uuid = str(char.uuid)
+
+                    def _make_cb(u: str) -> Callable[[int, bytearray], None]:
+                        def _cb(_sender: int, data: bytearray) -> None:
+                            logger.info("NOTIFY %s  hex=%s", u, data.hex())
+                            callback(u, data)
+                        return _cb
+
+                    try:
+                        cb = _make_cb(uuid)
+                        await client.start_notify(char.uuid, cb)
+                        self._notify_handlers[uuid] = cb
+                        subscribed.append(uuid)
+                        logger.info("Subscribed: %s", uuid)
+                    except Exception as e:
+                        logger.warning("Could not subscribe to %s: %s", uuid, e)
+        return subscribed
