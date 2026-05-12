@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from ..base import LLMResponse
+from .langfuse_observe import observed_generation
 
 
 class OllamaProvider:
@@ -43,10 +44,13 @@ class OllamaProvider:
     async def generate(self, prompt: str, model: str, temperature: float = 0.7) -> LLMResponse:
         try:
             payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": float(temperature)}}
-            async with httpx.AsyncClient(timeout=60.0) as c:
-                r = await c.post(self._base_url.rstrip("/") + "/api/generate", json=payload)
-                r.raise_for_status()
-                data = r.json()
+            async def _call():
+                async with httpx.AsyncClient(timeout=60.0) as c:
+                    r = await c.post(self._base_url.rstrip("/") + "/api/generate", json=payload)
+                    r.raise_for_status()
+                    return r.json()
+
+            data = await observed_generation("wizpr.ollama.generate", model, prompt, _call)
             return LLMResponse(text=str(data.get("response") or ""), raw=data)
         except Exception as e:
             return LLMResponse(text=f"[Ollama error] {e}", raw=None)
